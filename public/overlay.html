@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>BLT: Browser Lite Titles - Overlay</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    html, body {
+      width: 100vw;
+      height: 100vh;
+      background: transparent !important;
+      overflow: hidden;
+      user-select: none;
+      isolation: isolate;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: geometricPrecision;
+    }
+
+    #overlayCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 1920px;
+      height: 1080px;
+      pointer-events: none;
+      transform-origin: top left;
+      transform: translateZ(0);
+      backface-visibility: hidden;
+    }
+
+    .live-overlay-layer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.35s ease-in-out;
+      transform: translateZ(0);
+    }
+
+    .live-overlay-layer.fade-in { opacity: 1; }
+    .live-overlay-layer.cut-mode { transition: none !important; }
+
+    .layer-box {
+      position: absolute;
+      display: flex;
+      box-sizing: border-box;
+      overflow: hidden;
+      contain: paint;
+      backface-visibility: hidden;
+    }
+
+    .layer-text {
+      word-break: keep-all;
+      word-wrap: break-word;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      display: block;
+      paint-order: stroke fill;
+      stroke-linejoin: round;
+      stroke-miterlimit: 2;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .layer-text * {
+      paint-order: stroke fill;
+      stroke-linejoin: round;
+      stroke-miterlimit: 2;
+    }
+
+    .layer-text sup {
+      font-size: 0.6em;
+      line-height: 1;
+      display: inline-block;
+      vertical-align: baseline;
+      position: relative;
+      top: -0.4em;
+      text-decoration: inherit;
+      overflow: visible;
+    }
+    .layer-text sub {
+      font-size: 0.6em;
+      line-height: 1;
+      display: inline-block;
+      vertical-align: baseline;
+      position: relative;
+      top: 0.3em;
+      text-decoration: inherit;
+      overflow: visible;
+    }
+
+    .layer-text.is-vertical sup {
+      top: 0;
+      transform: translate(0.25em, -0.2em);
+    }
+    .layer-text.is-vertical sub {
+      top: 0;
+      transform: translate(0.25em, 0.2em);
+    }
+
+    .layer-text sup *,
+    .layer-text sub * {
+      font-size: inherit !important;
+      line-height: inherit !important;
+    }
+
+    .layer-img {
+      width: 100%;
+      height: 100%;
+      object-fit: fill;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="overlayCanvas"></div>
+
+  <script>
+    const overlayCanvas = document.getElementById('overlayCanvas');
+    const urlParams = new URLSearchParams(window.location.search);
+
+    const viewKey = urlParams.get('viewKey') || '';
+    const channelId = urlParams.get('channel') || '';
+
+    let currentLiveState = { isVisible: false, title: null, transition: 'fade', canvasW: 1920, canvasH: 1080 };
+    let lastRenderedSignature = '';
+    let lastHandledTimestamp = 0;
+    let localWs = null;
+    let pendingRemovalTimers = [];
+    let currentRenderToken = 0;
+
+    let retryDelay = 2000;
+    const MAX_RETRY_DELAY = 5000;
+
+    function sanitizeHtml(dirty) {
+      if (!dirty) return '';
+      const doc = new DOMParser().parseFromString(dirty, 'text/html');
+      const allowedTags = new Set(['B', 'I', 'U', 'S', 'SUP', 'SUB', 'BR', 'SPAN', 'DIV', 'P']);
+
+      function cleanNode(node) {
+        const children = Array.from(node.childNodes);
+        for (const child of children) {
+          if (child.nodeType === Node.ELEMENT_NODE) {
+            if (!allowedTags.has(child.tagName)) {
+              const textNode = document.createTextNode(child.textContent);
+              node.replaceChild(textNode, child);
+            } else {
+              const attrs = Array.from(child.attributes);
+              for (const attr of attrs) {
+                const name = attr.name.toLowerCase();
+                const val = attr.value.toLowerCase();
+                if (name.startsWith('on') || val.includes('javascript:') || val.startsWith('data:text') || val.startsWith('data:html')) {
+                  child.removeAttribute(attr.name);
+                }
+              }
+              cleanNode(child);
+            }
+          }
+        }
+      }
+      cleanNode(doc.body);
+      return doc.body.innerHTML;
+    }
+
+    function applyLastCharSpacingDefense(textContainerEl) {
+      if (!textContainerEl) return;
+      const spans = textContainerEl.querySelectorAll('span');
+      if (spans.length > 0) {
+        spans.forEach(s => { s.style.marginRight = ''; s.style.marginBottom = ''; });
+        const lastSpan = spans[spans.length - 1];
+        const sp = parseFloat(lastSpan.style.letterSpacing) || 0;
+        if (sp > 0) {
+          if (textContainerEl.style.writingMode && textContainerEl.style.writingMode.includes('vertical')) {
+            lastSpan.style.marginBottom = `-${sp}px`;
+          } else {
+            lastSpan.style.marginRight = `-${sp}px`;
+          }
+        }
+      } else {
+        const sp = parseFloat(textContainerEl.style.letterSpacing) || 0;
+        if (sp > 0) {
+          if (textContainerEl.style.writingMode && textContainerEl.style.writingMode.includes('vertical')) {
+            textContainerEl.style.marginBottom = `-${sp}px`;
+          } else {
+            textContainerEl.style.marginRight = `-${sp}px`;
+          }
+        }
+      }
+    }
+
+    function initLocalWebSocket() {
+      const wsUrl = `ws://${window.location.host}?channel=${channelId}&viewKey=${viewKey}`;
+      try {
+        localWs = new WebSocket(wsUrl);
+
+        localWs.onopen = () => {
+          retryDelay = 2000;
+        };
+
+        localWs.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.channel && msg.channel !== 'all' && msg.channel !== channelId) return;
+            handleReceivedData(msg.type, msg.data);
+          } catch (e) {
+            console.error('[BLT Overlay] Data processing error:', e);
+          }
+        };
+
+        localWs.onclose = () => {
+          setTimeout(() => {
+            initLocalWebSocket();
+          }, retryDelay);
+          retryDelay = Math.min(retryDelay + 1000, MAX_RETRY_DELAY);
+        };
+
+        localWs.onerror = () => {
+          try { localWs.close(); } catch (e) {}
+        };
+      } catch (e) {
+        setTimeout(initLocalWebSocket, retryDelay);
+        retryDelay = Math.min(retryDelay + 1000, MAX_RETRY_DELAY);
+      }
+    }
+
+    function handleReceivedData(type, data) {
+      if (!data) return;
+
+      if (type === 'live') {
+        if (data.timestamp && data.timestamp === lastHandledTimestamp) return;
+        lastHandledTimestamp = data.timestamp || Date.now();
+        currentLiveState = Object.assign(currentLiveState, data);
+        handleLiveUpdate();
+      } else if (type === 'canvas') {
+        currentLiveState.canvasW = data.canvasW || 1920;
+        currentLiveState.canvasH = data.canvasH || 1080;
+        currentLiveState.transition = data.transition || 'fade';
+        fitCanvasToWindow();
+      } else if (type === 'project_reloaded') {
+        if (data.store && data.store.channelData && data.store.channelData[channelId]) {
+          const chData = data.store.channelData[channelId];
+          if (chData.canvasConfig) {
+            currentLiveState.canvasW = chData.canvasConfig.canvasW || 1920;
+            currentLiveState.canvasH = chData.canvasConfig.canvasH || 1080;
+            currentLiveState.transition = chData.canvasConfig.transition || 'fade';
+          }
+          if (chData.liveState) {
+            currentLiveState = Object.assign(currentLiveState, chData.liveState);
+          }
+        }
+        fitCanvasToWindow();
+        handleLiveUpdate();
+      }
+    }
+
+    function fitCanvasToWindow() {
+      const cw = currentLiveState.canvasW || 1920;
+      const ch = currentLiveState.canvasH || 1080;
+
+      overlayCanvas.style.width = cw + 'px';
+      overlayCanvas.style.height = ch + 'px';
+
+      const winW = window.innerWidth || cw;
+      const winH = window.innerHeight || ch;
+
+      const scale = Math.min(winW / cw, winH / ch);
+      overlayCanvas.style.transform = `scale(${scale}) translateZ(0)`;
+    }
+
+    function clearPendingRemovals() {
+      pendingRemovalTimers.forEach(id => clearTimeout(id));
+      pendingRemovalTimers = [];
+      const removingLayers = overlayCanvas.querySelectorAll('.live-overlay-layer:not(.fade-in)');
+      removingLayers.forEach(el => el.remove());
+    }
+
+    function buildOverlayLayerDom(titleData) {
+      const titleContainer = document.createElement('div');
+      titleContainer.className = 'live-overlay-layer';
+
+      const totalLayers = titleData.layers.length;
+      titleData.layers.forEach((layer, index) => {
+        if (layer.type === 'image' && !layer.url) return;
+
+        const posX = (layer.boxX !== undefined) ? layer.boxX : 960;
+        const posY = (layer.boxY !== undefined) ? layer.boxY : 930;
+        const posW = (layer.boxW !== undefined) ? layer.boxW : 1600;
+        const posH = (layer.boxH !== undefined) ? layer.boxH : 140;
+
+        const { left, top } = getBoxLeftTop(posX, posY, posW, posH, layer.boxAnchor || 'center');
+
+        const box = document.createElement('div');
+        box.className = 'layer-box';
+        box.setAttribute('data-font-size', Math.max(1, layer.fontSize || 48));
+        box.style.left = left + 'px';
+        box.style.top = top + 'px';
+        box.style.width = posW + 'px';
+        box.style.height = posH + 'px';
+        box.style.zIndex = totalLayers - index;
+
+        if (layer.type === 'text') {
+          box.style.padding = '12px 24px';
+          box.style.backgroundColor = hexToRgba(layer.bgColor || '#000000', layer.bgOpacity !== undefined ? layer.bgOpacity : 0);
+          box.style.borderRadius = Math.max(0, layer.borderRadius !== undefined ? layer.borderRadius : 0) + 'px';
+
+          const isVertical = !!layer.verticalWriting;
+          const vAlign = layer.verticalAlign || 'center';
+          const hAlign = layer.textAlign || 'center';
+
+          if (isVertical) {
+            box.style.flexDirection = 'row';
+            box.style.justifyContent = (hAlign === 'left') ? 'flex-start' : (hAlign === 'right') ? 'flex-end' : 'center';
+            box.style.alignItems = (vAlign === 'top') ? 'flex-start' : (vAlign === 'bottom') ? 'flex-end' : 'center';
+          } else {
+            box.style.flexDirection = 'column';
+            box.style.justifyContent = (vAlign === 'top') ? 'flex-start' : (vAlign === 'bottom') ? 'flex-end' : 'center';
+            box.style.alignItems = (hAlign === 'left') ? 'flex-start' : (hAlign === 'right') ? 'flex-end' : 'center';
+          }
+
+          const textSpan = document.createElement('div');
+          textSpan.className = 'layer-text';
+          textSpan.style.fontFamily = layer.fontFamily || '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          textSpan.style.fontSize = Math.max(1, layer.fontSize || 48) + 'px';
+          textSpan.style.letterSpacing = (layer.letterSpacing || 0) + 'px';
+          textSpan.style.color = layer.textColor || '#ffffff';
+          textSpan.style.fontWeight = layer.bold ? 'bold' : 'normal';
+          textSpan.style.fontStyle = layer.italic ? 'italic' : 'normal';
+
+          if (isVertical) {
+            textSpan.style.writingMode = 'vertical-rl';
+            textSpan.style.textOrientation = 'upright';
+            textSpan.style.width = 'auto';
+            textSpan.style.height = 'auto';
+            textSpan.style.textAlign = (vAlign === 'top') ? 'left' : (vAlign === 'bottom') ? 'right' : 'center';
+          } else {
+            textSpan.style.writingMode = 'horizontal-tb';
+            textSpan.style.textOrientation = 'mixed';
+            textSpan.style.width = '100%';
+            textSpan.style.height = 'auto';
+            textSpan.style.textAlign = hAlign;
+          }
+          textSpan.classList.toggle('is-vertical', isVertical);
+          textSpan.style.textDecoration = 'none';
+
+          if (layer.strokeWidth && layer.strokeWidth > 0) {
+            textSpan.style.webkitTextStroke = `${layer.strokeWidth * 2}px ${layer.strokeColor || '#000000'}`;
+            textSpan.style.paintOrder = 'stroke fill';
+            textSpan.style.strokeLinejoin = 'round';
+            textSpan.style.strokeMiterlimit = '2';
+            textSpan.style.textShadow = `0 2px 8px rgba(0,0,0,0.5)`;
+          }
+
+          textSpan.innerHTML = sanitizeHtml(layer.text || '');
+          applyLastCharSpacingDefense(textSpan);
+          box.appendChild(textSpan);
+          titleContainer.appendChild(box);
+        } else if (layer.type === 'image') {
+          box.style.padding = '0';
+          const img = document.createElement('img');
+          img.className = 'layer-img';
+
+          let finalUrl = layer.url || '';
+          if (finalUrl) {
+            if (finalUrl.startsWith('http://localhost') || finalUrl.startsWith('http://127.0.0.1')) {
+              finalUrl = finalUrl.replace(/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i, window.location.origin);
+            } else if (finalUrl.startsWith('/')) {
+              finalUrl = window.location.origin + finalUrl;
+            }
+          }
+
+          img.src = finalUrl;
+          img.onerror = () => { 
+            console.error('[Overlay Image Load Failed]:', finalUrl); 
+            img.style.display = 'none'; 
+          };
+          box.appendChild(img);
+          titleContainer.appendChild(box);
+        }
+      });
+
+      return titleContainer;
+    }
+
+    function adjustAllTextFit(container) {
+      if (!container) return;
+      const boxes = container.querySelectorAll('.layer-box');
+      boxes.forEach(box => {
+        const textSpan = box.querySelector('.layer-text');
+        const targetSize = Math.max(1, parseInt(box.getAttribute('data-font-size'), 10) || 48);
+        if (textSpan) fitTextWithinBox(box, textSpan, targetSize, textSpan.style.writingMode.includes('vertical'));
+      });
+    }
+
+    async function handleLiveUpdate() {
+      fitCanvasToWindow();
+
+      const isCut = (currentLiveState.transition === 'cut');
+      const activeTitle = currentLiveState.title;
+
+      const currentSignature = (currentLiveState.isVisible && activeTitle) 
+        ? `${currentLiveState.timestamp || 0}_${currentLiveState.transition || 'fade'}_${JSON.stringify(activeTitle)}` 
+        : '';
+
+      if (currentSignature === lastRenderedSignature) return;
+      lastRenderedSignature = currentSignature;
+
+      const thisToken = ++currentRenderToken;
+      clearPendingRemovals();
+
+      if (currentLiveState.isVisible && activeTitle && activeTitle.layers) {
+        const newLayerDom = buildOverlayLayerDom(activeTitle);
+        overlayCanvas.appendChild(newLayerDom);
+        adjustAllTextFit(newLayerDom);
+
+        const imgElements = Array.from(newLayerDom.querySelectorAll('img'));
+        if (imgElements.length > 0) {
+          await Promise.all(imgElements.map(img => {
+            if (img.complete && img.naturalWidth !== 0) {
+              return typeof img.decode === 'function' ? img.decode().catch(() => {}) : Promise.resolve();
+            }
+            return new Promise(resolve => {
+              img.onload = () => {
+                if (typeof img.decode === 'function') {
+                  img.decode().then(resolve).catch(resolve);
+                } else {
+                  resolve();
+                }
+              };
+              img.onerror = resolve;
+            });
+          }));
+        }
+
+        if (thisToken !== currentRenderToken) {
+          if (newLayerDom.parentNode) newLayerDom.parentNode.removeChild(newLayerDom);
+          return;
+        }
+
+        const oldLayers = Array.from(overlayCanvas.querySelectorAll('.live-overlay-layer')).filter(el => el !== newLayerDom);
+        oldLayers.forEach(el => el.classList.toggle('cut-mode', isCut));
+
+        if (isCut) {
+          newLayerDom.classList.add('cut-mode', 'fade-in');
+          oldLayers.forEach(el => el.remove());
+        } else {
+          requestAnimationFrame(() => {
+            newLayerDom.classList.add('fade-in');
+          });
+          oldLayers.forEach(el => {
+            el.classList.remove('fade-in');
+            const timer = setTimeout(() => {
+              if (el.parentNode) el.parentNode.removeChild(el);
+            }, 380);
+            pendingRemovalTimers.push(timer);
+          });
+        }
+      } else {
+        const oldLayers = Array.from(overlayCanvas.querySelectorAll('.live-overlay-layer'));
+        oldLayers.forEach(el => el.classList.toggle('cut-mode', isCut));
+
+        if (isCut) {
+          oldLayers.forEach(el => el.remove());
+        } else {
+          oldLayers.forEach(el => {
+            el.classList.remove('fade-in');
+            const timer = setTimeout(() => {
+              if (el.parentNode) el.parentNode.removeChild(el);
+            }, 380);
+            pendingRemovalTimers.push(timer);
+          });
+        }
+      }
+    }
+
+    function getBoxLeftTop(x, y, w, h, anchor) {
+      let left = x, top = y;
+      if (anchor === 'top-center' || anchor === 'center' || anchor === 'bottom-center') left = x - w / 2;
+      else if (anchor === 'top-right' || anchor === 'center-right' || anchor === 'bottom-right') left = x - w;
+      if (anchor === 'center-left' || anchor === 'center' || anchor === 'center-right') top = y - h / 2;
+      else if (anchor === 'bottom-left' || anchor === 'bottom-center' || anchor === 'bottom-right') top = y - h;
+      return { left, top };
+    }
+
+    function hexToRgba(hex, opacity) {
+      if (!hex) return 'transparent';
+      let c;
+      if (/^#([A-Fa-f0-9]{3}){1,2}$/.test(hex)) {
+        c = hex.substring(1).split('');
+        if (c.length === 3) c = [c[0], c[0], c[1], c[1], c[2], c[2]];
+        c = '0x' + c.join('');
+        return 'rgba(' + [(c >> 16) & 255, (c >> 8) & 255, c & 255].join(',') + ',' + opacity + ')';
+      }
+      return hex;
+    }
+
+    function fitTextWithinBox(boxEl, textEl, maxFontSize, isVertical) {
+      if (!boxEl || !textEl) return;
+      const boxW = boxEl.clientWidth || parseInt(boxEl.style.width, 10) || 0,
+            boxH = boxEl.clientHeight || parseInt(boxEl.style.height, 10) || 0;
+      if (boxW <= 0 || boxH <= 0) return;
+
+      const maxHeight = boxH - 24, maxWidth = boxW - 48;
+      if (maxHeight <= 0 || maxWidth <= 0) return;
+
+      const baseSize = Math.max(1, maxFontSize || 48);
+      const spans = Array.from(textEl.querySelectorAll('span'));
+
+      spans.forEach(s => {
+        if (!s.dataset.origSize && s.style.fontSize) {
+          const parsed = parseFloat(s.style.fontSize);
+          if (!isNaN(parsed) && parsed > 0) s.dataset.origSize = parsed;
+        }
+      });
+
+      const applyScale = (size) => {
+        textEl.style.fontSize = size + 'px';
+        const ratio = size / baseSize;
+        spans.forEach(s => {
+          if (s.dataset.origSize) {
+            s.style.fontSize = Math.max(1, Math.round(parseFloat(s.dataset.origSize) * ratio)) + 'px';
+          }
+        });
+      };
+
+      let low = 1, high = baseSize, best = low;
+      while (low <= high) {
+        const mid = Math.floor((low + high) / 2);
+        applyScale(mid);
+
+        if (textEl.scrollHeight <= maxHeight && textEl.scrollWidth <= maxWidth) {
+          best = mid;
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+
+      applyScale(best);
+      if (best >= baseSize) {
+        spans.forEach(s => {
+          if (s.dataset.origSize) s.style.fontSize = s.dataset.origSize + 'px';
+          else s.style.fontSize = '';
+        });
+      }
+    }
+
+    window.addEventListener('resize', fitCanvasToWindow);
+    window.addEventListener('DOMContentLoaded', () => {
+      fitCanvasToWindow();
+      initLocalWebSocket();
+    });
+  </script>
+</body>
+</html>
