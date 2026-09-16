@@ -311,4 +311,4 @@ npm start
 ## 6. 다국어 안내 및 라이선스
 
 * **원문 및 번역 안내:** 본 프로젝트의 모든 기능 기획, 아키텍처 설계, UI 텍스트 및 핵심 로직은 **한국어 원문을 기준**으로 제작되었습니다. 영문 문서는 글로벌 사용자의 접근성을 돕기 위해 인공지능(AI)을 활용하여 번역되었습니다.
-* **라이선스:** 본 프로젝트는 [MIT License](LICENSE)에 따라 자유롭게 수정, 복제 및 재배포가 가능합니다.<img width="1920" height="1152" alt="screenshot_01" src="https://github.com/user-attachments/assets/873c3f47-6b74-45f8-866b-461dec51fbd3" />
+* **라이선스:** 본 프로젝트는 [MIT License](LICENSE)에 따라 자유롭게 수정, 복제 및 재배포가 가능합니다.
