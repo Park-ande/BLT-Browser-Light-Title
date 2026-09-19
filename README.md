@@ -2,6 +2,7 @@
 Real-time live title overlay system for OBS Studio Browser Source | OBS Studio 브라우저 소스 연동을 위한 실시간 라이브 자막 오버레이 시스템
   
 <img width="1920" height="1152" alt="screenshot_02" src="https://github.com/user-attachments/assets/79bcd035-121f-470c-9da0-b034a126343f" />  
+https://youtu.be/vfeozZyURfE</br></br>
 
 > **Notice:** This documentation is provided in both English and Korean. The English version below is an AI translation of the original Korean text. The original Korean documentation follows immediately in the second section.  
 > **안내:** 본 문서는 영문 및 한국어로 구성되어 있습니다. 상단의 영문 문서는 한국어 원문을 AI로 번역한 버전이며, 하단에 한국어 원문이 이어집니다.
